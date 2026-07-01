@@ -23,6 +23,7 @@ Built by five units against a **frozen** contract (`contract.py`) over a shared 
 contract.py     FROZEN types + seam interfaces. Changed only by deliberate, owner-flagged amendment.
 locators.py     FROZEN behaviour. The ONE place a cell locator is minted/parsed.
 db.py           sqlite connection helper + init_all()
+embed.py         the ONE shared embedder (fastembed bge-small) — single MODEL_NAME pin, one space
 ontology.yaml   hand-authored nodes (deliberately omits `region` — an intentional gap) + concept map
 seed/           make_seed.py -> crm_a.csv, crm_b.csv (two divergent CRMs, planted identities)
 twin_core/      Unit 1 — store, build_cells, reference inversion, seed_grouping, MasterTable
@@ -123,13 +124,19 @@ the initial freeze to reconcile the seam with the overlay design that arrived la
 fails closed. A registered `"default"` policy (map-visible, dereference denied) keeps the mint
 path intentional.
 
+**One shared embedder:** `embed.py` (fastembed `bge-small-en-v1.5`) is the single canonical
+embedder for the whole system. Classification (Unit 2) and entity-resolution (Unit 3) previously
+carried their own copies pinning the same model; they were consolidated so there is exactly **one**
+`MODEL_NAME` pin and one embedding space — the two can never silently drift apart on a model bump.
+A determinism test asserts the same string embeds bit-for-bit identically through both units' paths.
+
 ## Status
 
 All five units built and merged against the frozen contract; the money-shot end-to-end test is
-green. **Full suite: 60 tests pass** (per-unit acceptance + semantic descent + e2e money shot +
-integration fixes), offline and deterministic.
+green. **Full suite: 64 tests pass** (per-unit acceptance + semantic descent + e2e money shot +
+integration fixes + shared-embedder determinism), offline and deterministic.
 
-- **Unit 0 (shared foundation)** — contract, `locators.py`, db, ontology, seed, packaging.
+- **Unit 0 (shared foundation)** — contract, `locators.py`, db, `embed.py`, ontology, seed, packaging.
 - **Unit 1 (twin core)** — `SqliteMasterTableStore` (overridable grouping), `build_cells`,
   `seed_grouping`, `MasterTable`.
 - **Unit 2 (onboarding)** — lazy onboarding, shortlist+judge classifier, control plane, concept
@@ -139,4 +146,4 @@ integration fixes), offline and deterministic.
 - **Unit 4 (fetch)** — `CsvSourceReader`, fetch ladder (Gate 2), conflict object, cross-source join.
 - **Unit 5 (audit)** — write-only, tamper-evident audit sink.
 - **Integration** — `demo.py` money-shot harness + `tests/test_e2e_moneyshot.py`; fail-closed
-  policy lookup and the two contract amendments above.
+  policy lookup, the two contract amendments above, and the shared `embed.py` embedder.
