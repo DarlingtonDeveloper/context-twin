@@ -45,7 +45,7 @@ from typing import Callable, Optional
 import yaml
 
 from contract import AuditEntry, ClassificationProposal
-from onboarding.embed import Embedder, cosine, default_embedder
+from embed import Embedder, cosine, default_embedder
 
 # shortlist (recall): keep the top-k candidates plus anything within MARGIN of the top.
 SHORTLIST_K = 5
