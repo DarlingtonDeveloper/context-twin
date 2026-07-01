@@ -1,12 +1,52 @@
+# Hand-authored ontology. Unit 2 owns edits (Unit 0 seeded it).
+# `description` is the canonical concept text (contract OntologyNode). `exemplars` are
+# GENERIC concept phrasings + archetype values that Unit 2's classifier embeds and MAX-POOLS
+# over to NOMINATE a shortlist of candidate nodes (recall). An LLM judge then decides among
+# the shortlist by reading the actual sample values (precision). Exemplars are deliberately
+# generic archetypes — NOT the seed's specific people/orgs/titles — so the shortlist is not
+# tuned to one source; the judge reading real values is what generalises to any source.
+# Extra keys are ignored by the frozen OntologyNode model, so this stays contract-safe.
+#
+# NOTE: there is deliberately NO 'region' node. crm_b.region must NOT auto-classify; it
+# proposes a new node through the control plane. This gap is intentional.
 nodes:
   - name: person
-    description: a human individual's full name or personal name
+    description: a person's name — a human individual's full name, personal name, first and last name, or initials
+    exemplars:
+      - full name of a person
+      - personal name
+      - first and last name
+      - Jane Doe
+      - John Smith
+      - A. Rivera
   - name: email
     description: an email address for contacting a person
+    exemplars:
+      - email address
+      - contact email
+      - jane.doe@example.com
+      - user@example.org
   - name: role
-    description: a job title or role held by a person, e.g. VP, Director, Head of Ops
+    description: a job title or professional role held by a person, e.g. VP, Director, Head of Ops
+    exemplars:
+      - job title
+      - professional role or position
+      - Chief Technology Officer
+      - Regional Sales Manager
+      - Head of Marketing
+      - Software Engineer
   - name: organisation
     description: the name of a company or employer
+    exemplars:
+      - company name
+      - employer name
+      - business or organisation
+      - Example Corp
+      - Contoso Ltd
+      - Northwind Traders
   - name: phone
     description: a telephone number
-# NOTE: no 'region' node. crm_b.region must quarantine and propose. This gap is intentional.
+    exemplars:
+      - telephone number
+      - phone number
+      - +1 555 010 1234
