@@ -38,8 +38,11 @@ def init_all(conn: sqlite3.Connection) -> None:
     from twin_core.store import init_cells
     init_cells(conn)
 
-    # Units 2/4/5 register their tables here once built, e.g.:
-    #   from onboarding.control_plane import init_control_plane; init_control_plane(conn)
+    # Unit 2 — the control plane (control_plane + control_plane_meta).
+    from onboarding.control_plane import init_control_plane
+    init_control_plane(conn)
+
+    # Units 4/5 register their tables here once built, e.g.:
     #   from fetch.cache import init_materialised; init_materialised(conn)
     #   from audit.sink import init_audit_log; init_audit_log(conn)
 
