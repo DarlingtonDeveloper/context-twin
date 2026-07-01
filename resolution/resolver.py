@@ -31,7 +31,7 @@ from contract import (
 )
 from locators import make_locator, parse_locator, row_key_of, source_of
 from twin_core.inversion import normalise_email
-from resolution.embed import Embedder, cosine, default_embedder
+from embed import Embedder, cosine, default_embedder
 from resolution.gate import PredicateGate, dereference_predicate
 
 HIGH = 0.88   # name|org cosine auto-match (Dana sits at 0.809 -> middle band, by design)
