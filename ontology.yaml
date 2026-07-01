@@ -1,0 +1,12 @@
+nodes:
+  - name: person
+    description: a human individual's full name or personal name
+  - name: email
+    description: an email address for contacting a person
+  - name: role
+    description: a job title or role held by a person, e.g. VP, Director, Head of Ops
+  - name: organisation
+    description: the name of a company or employer
+  - name: phone
+    description: a telephone number
+# NOTE: no 'region' node. crm_b.region must quarantine and propose. This gap is intentional.
