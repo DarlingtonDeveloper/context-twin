@@ -8,9 +8,12 @@ The registry owns the policy CALLABLES. Cells store only `policy_id` (Unit 1); t
 never touch the db. A handful of demo policies are registered here.
 """
 from __future__ import annotations
+import logging
 from datetime import datetime, timezone
 
 from contract import Capability, CellPolicy, Context, Predicate
+
+_log = logging.getLogger(__name__)
 
 
 def _now() -> datetime:
@@ -63,19 +66,40 @@ SECRET = CellPolicy(policy_id="secret", see_existence=deny, see_type=deny,
 HR_SCOPED = CellPolicy(policy_id="hr_scoped", see_existence=hr_dereference,
                        see_type=hr_dereference, see_state=allow, dereference=hr_dereference)
 
+# The registered DEFAULT a cell points at when no explicit policy is chosen at mint time. The
+# honest "you can see it exists, you cannot read it" posture: visible in the map (existence +
+# type + state) but NOT dereferenceable without a specific grant. It is a REGISTERED policy so
+# the common mint path is intentional, never a lookup for an id the registry doesn't know.
+DEFAULT = CellPolicy(policy_id="default", see_existence=allow, see_type=allow,
+                     see_state=allow, dereference=deny)
+
+# The fail-closed fallback `get` returns for an UNKNOWN policy_id: every facet denies, so the
+# cell is invisible to projection (Gate 1) and unreadable at fetch (Gate 2) — a governance gap
+# fails closed (deny), never open, and never crashes a live query.
+DENY_ALL = CellPolicy(policy_id="__deny_all__", see_existence=deny, see_type=deny,
+                      see_state=deny, dereference=deny)
+
 
 class PolicyRegistry:
-    """policy_id -> CellPolicy (with live callables)."""
+    """policy_id -> CellPolicy (with live callables). Unknown ids fail CLOSED (deny-all)."""
 
     def __init__(self, policies: list[CellPolicy] | None = None) -> None:
         self._by_id: dict[str, CellPolicy] = {}
-        for p in (policies if policies is not None else [OPEN, ROLE_GATED, SECRET, HR_SCOPED]):
+        for p in (policies if policies is not None else [OPEN, ROLE_GATED, SECRET, HR_SCOPED, DEFAULT]):
             self._by_id[p.policy_id] = p
+        self.unknown_lookups = 0   # observable counter: an unknown id is a gap you want to see
 
     def get(self, policy_id: str) -> CellPolicy:
-        if policy_id not in self._by_id:
-            raise KeyError(f"unknown policy_id {policy_id!r}")
-        return self._by_id[policy_id]
+        """Fail CLOSED. An unregistered policy_id is a governance gap (typo, unmigrated source,
+        renamed policy): return a deny-all policy so the cell is invisible and unreadable, rather
+        than raising `KeyError` and crashing a live query. The lookup is counted + logged so the
+        gap is observable, not silent."""
+        policy = self._by_id.get(policy_id)
+        if policy is None:
+            self.unknown_lookups += 1
+            _log.warning("PolicyRegistry.get: unknown policy_id %r -> deny-all (fail-closed)", policy_id)
+            return DENY_ALL
+        return policy
 
     def register(self, policy: CellPolicy) -> None:
         self._by_id[policy.policy_id] = policy
