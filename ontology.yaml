@@ -1,10 +1,11 @@
 # Hand-authored ontology. Unit 2 owns edits (Unit 0 seeded it).
 # `description` is the canonical concept text (contract OntologyNode). `exemplars` are
-# additional short strings (concept phrasings + realistic example values) that Unit 2's
-# classifier embeds and MAX-POOLS over for field-to-node matching — value-bearing
-# exemplars separate weak-but-true fields (e.g. an abbreviated `name`) from spurious
-# near-misses far better than a single description sentence. Extra keys are ignored by
-# the frozen OntologyNode model, so this stays contract-safe.
+# GENERIC concept phrasings + archetype values that Unit 2's classifier embeds and MAX-POOLS
+# over to NOMINATE a shortlist of candidate nodes (recall). An LLM judge then decides among
+# the shortlist by reading the actual sample values (precision). Exemplars are deliberately
+# generic archetypes — NOT the seed's specific people/orgs/titles — so the shortlist is not
+# tuned to one source; the judge reading real values is what generalises to any source.
+# Extra keys are ignored by the frozen OntologyNode model, so this stays contract-safe.
 #
 # NOTE: there is deliberately NO 'region' node. crm_b.region must NOT auto-classify; it
 # proposes a new node through the control plane. This gap is intentional.
@@ -15,37 +16,37 @@ nodes:
       - full name of a person
       - personal name
       - first and last name
-      - Colin Marsh
-      - Dana Osei
-      - C. Marsh
+      - Jane Doe
+      - John Smith
+      - A. Rivera
   - name: email
     description: an email address for contacting a person
     exemplars:
       - email address
       - contact email
-      - colin.marsh@stripe.com
-      - someone@example.com
+      - jane.doe@example.com
+      - user@example.org
   - name: role
     description: a job title or professional role held by a person, e.g. VP, Director, Head of Ops
     exemplars:
       - job title
       - professional role or position
-      - VP Engineering
-      - Director of Platform
-      - Head of Operations
-      - Operations Lead
+      - Chief Technology Officer
+      - Regional Sales Manager
+      - Head of Marketing
+      - Software Engineer
   - name: organisation
     description: the name of a company or employer
     exemplars:
       - company name
       - employer name
       - business or organisation
-      - Stripe
-      - Acme
-      - Globex
+      - Example Corp
+      - Contoso Ltd
+      - Northwind Traders
   - name: phone
     description: a telephone number
     exemplars:
       - telephone number
       - phone number
-      - +1 555 123 4567
+      - +1 555 010 1234

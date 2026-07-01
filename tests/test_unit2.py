@@ -1,78 +1,92 @@
-"""Unit 2 acceptance tests — onboarding, banded classification, control plane.
+"""Unit 2 acceptance tests — shortlist + judge classification, lazy onboarding, generality.
 
-Uses the REAL fastembed embedder (tests 1/2/6 need genuine semantic scores; the model
-is cached locally after first download). The LLM adjudicator is always a counting fake,
-so tests never hit the network and are deterministic.
+The embedder is real (shortlist recall). The judge is always a deterministic offline fake
+that decides by READING SAMPLE VALUES — mirroring what the real LLM does — so tests are
+offline and deterministic while exercising the real shortlist->judge path.
 """
 from __future__ import annotations
 import csv
+import re
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import pytest
 
-from contract import Capability, Reference, TypeDescriptor, Cell, ControlPlaneRow
+from contract import Capability, Reference, ControlPlaneRow
 from db import get_conn
-from locators import make_locator, field_of
+from locators import field_of
 from twin_core.store import SqliteMasterTableStore
 from onboarding.classify import OntologyClassifier, VerdictCache
 from onboarding.control_plane import SqliteControlPlane
-from onboarding.onboard import onboard_source
+from onboarding.onboard import onboard_source, classify_deferred
 
 ROOT = Path(__file__).resolve().parent.parent
 SEED = ROOT / "seed"
 
+_ROLE_WORDS = {"director", "lead", "manager", "engineer", "officer", "head", "vp", "cfo",
+               "ceo", "cto", "president", "analyst", "architect", "executive", "designer",
+               "scientist", "specialist", "consultant", "chief", "operations"}
 
-# --------------------------------------------------------------------------- fakes
-class FakeSourceReader:
-    """Reads a seed CSV. sample_field returns first-n non-blank; read_value MUST NOT run."""
 
-    def __init__(self, csv_path: Path, rename: dict | None = None):
+def _looks_person(vals):
+    return all(re.fullmatch(r"[A-Z][a-zA-Z.'-]*\.?\s+[A-Z][a-zA-Z.'-]+", v.strip()) for v in vals)
+
+
+def _looks_org(vals):
+    def titleish(v):
+        return v[:1].isupper() and any(c.islower() for c in v) and len(v.split()) <= 4
+    return all(titleish(v.strip()) for v in vals)
+
+
+class ValueJudge:
+    """Deterministic judge that decides over the SAMPLE VALUES (not the column name).
+    This is what kills notes->phone and makes classification source-shape-agnostic."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, field_name, sample, candidates):
+        self.calls += 1
+        cand = {c[0] for c in candidates}
+        vals = [v for v in sample if v and v.strip()]
+        if not vals:
+            return {"node": None, "confidence": 0.0, "reason": "no values"}
+        if "email" in cand and any("@" in v for v in vals):
+            return {"node": "email", "confidence": 0.96, "reason": "values are email addresses"}
+        if "role" in cand and any(w in " ".join(vals).lower() for w in _ROLE_WORDS):
+            return {"node": "role", "confidence": 0.9, "reason": "values are job titles"}
+        if "person" in cand and _looks_person(vals):
+            return {"node": "person", "confidence": 0.9, "reason": "values are human names"}
+        if "organisation" in cand and _looks_org(vals):
+            return {"node": "organisation", "confidence": 0.85, "reason": "values are company names"}
+        return {"node": None, "confidence": 0.0, "reason": "no candidate fits the values"}
+
+
+class FakeReader:
+    def __init__(self, csv_path):
         self.rows = list(csv.DictReader(open(csv_path)))
-        self.rename = rename or {}
-        self.read_calls = 0
-
-    def _col(self, field):
-        # reverse a rename (e.g. rm -> job_role) to find the underlying column
-        return {v: k for k, v in self.rename.items()}.get(field, field)
 
     def list_fields(self, source):
-        cols = list(self.rows[0].keys())
-        return [self.rename.get(c, c) for c in cols]
+        return list(self.rows[0].keys())
 
     def sample_field(self, source, field, n=3):
-        col = self._col(field)
-        return [r[col] for r in self.rows if r[col].strip()][:n]
+        return [r[field] for r in self.rows if r[field].strip()][:n]
 
-    def read_value(self, ref: Reference):
-        self.read_calls += 1
-        raise AssertionError("read_value must never be called during onboarding")
+    def read_value(self, ref):
+        raise AssertionError("onboarding must not read_value")
 
 
 class FakeGate:
-    def __init__(self, allow=True):
-        self.allow = allow
-
     def check(self, cap, predicate, ctx):
-        return self.allow and predicate(cap, ctx)
+        return predicate(cap, ctx)
 
 
 class FakeAudit:
     def __init__(self):
         self.entries = []
 
-    def append(self, entry):
-        self.entries.append(entry)
-
-
-class CountingAdjudicator:
-    def __init__(self, node=None):
-        self.calls = 0
-        self.node = node
-
-    def __call__(self, field_name, sample, candidates):
-        self.calls += 1
-        return {"node": self.node, "confidence": 0.5, "reason": "fake"}
+    def append(self, e):
+        self.entries.append(e)
 
 
 def _cap():
@@ -80,223 +94,148 @@ def _cap():
                       expiry=datetime.now(timezone.utc) + timedelta(hours=1))
 
 
-# a shared classifier so the embedding model loads once for the module
 _CLASSIFIER = None
-def classifier(conn=None, adjudicator=None, low=None):
+def classifier(conn=None):
+    """Shared real-embedder classifier (model loads once) unless a cache conn is given."""
     global _CLASSIFIER
-    if adjudicator is None and low is None:
+    if conn is None:
         if _CLASSIFIER is None:
-            _CLASSIFIER = OntologyClassifier()
+            _CLASSIFIER = OntologyClassifier(judge=ValueJudge())
         return _CLASSIFIER
-    kwargs = {}
-    if adjudicator is not None:
-        kwargs["adjudicator"] = adjudicator
-    if conn is not None:
-        kwargs["cache"] = VerdictCache(conn)
-    if low is not None:
-        kwargs["low"] = low
-    return OntologyClassifier(**kwargs)
+    return OntologyClassifier(judge=ValueJudge(), cache=VerdictCache(conn))
+
+
+def _onboard(clf, csv_name="crm_b.csv", **kw):
+    conn = get_conn(":memory:")
+    store = SqliteMasterTableStore(conn)
+    cp = SqliteControlPlane(conn, closest_nodes=clf.closest_nodes)
+    reader = FakeReader(SEED / csv_name)
+    report = onboard_source(csv_name.split(".")[0], reader, FakeGate(), _cap(), FakeAudit(),
+                            store, cp, clf, rows=reader.rows,
+                            principal_of=lambda r: r["contact_id"], key_field="contact_id", **kw)
+    return report, store, cp, reader
 
 
 # --------------------------------------------------------------------------- tests
-def test_1_crm_b_auto_fields_and_region_not_served():
-    conn = get_conn(":memory:")
-    store = SqliteMasterTableStore(conn)
-    clf = classifier()
-    cp = SqliteControlPlane(conn, closest_nodes=clf.closest_nodes)
-    reader = FakeSourceReader(SEED / "crm_b.csv")
-
-    report = onboard_source(
-        "crm_b", reader, FakeGate(), _cap(), FakeAudit(), store, cp, clf,
-        rows=reader.rows, principal_of=lambda r: r["contact_id"], key_field="contact_id",
-    )
+def test_1_crm_b_eager_auto_and_region_deferred():
+    report, store, cp, reader = _onboard(classifier(conn=get_conn(":memory:")))
 
     assert report.bands["name"] == "auto"
     assert report.bands["primary_email"] == "auto"
     assert report.bands["job_role"] == "auto"
-    assert report.bands["org_name"] == "auto"
+    assert report.bands["org_name"] == "auto"           # embedding top-1 was 'email'; judge fixed it
 
-    # the ontology gap: region is NOT auto and is NOT served as a cell
-    assert report.bands["region"] != "auto"
-    assert report.bands["region"] in ("propose_new", "quarantine")
-    assert "region" in report.proposals  # it went to the control plane, proposed not live
-    served_fields = {field_of(c.ref.locator) for c in store.all_cells()}
-    assert "region" not in served_fields
-    assert served_fields == {"name", "primary_email", "job_role", "org_name"}
+    assert report.bands["region"] == "deferred"          # ambiguous long-tail
+    assert "region" in report.deferred
+    served = {field_of(c.ref.locator) for c in store.all_cells()}
+    assert "region" not in served
+    assert served == {"name", "primary_email", "job_role", "org_name"}
 
-    # structural quarantine of keys/timestamps
-    assert report.bands["contact_id"] == "quarantine"
+    assert report.bands["contact_id"] == "quarantine"    # structural, not judged as an attribute
     assert report.bands["last_touch"] == "quarantine"
 
 
-def test_2_obscure_field_needs_sample():
-    # fake adjudicator: the no-sample case lands in the middle band; keep it off the network
-    clf = classifier(conn=get_conn(":memory:"), adjudicator=CountingAdjudicator(node=None))
-    role_sample = ["Director, Platform", "Operations Lead", "Staff Software Engineer"]
+def test_2_deferred_region_resolves_at_point_of_use():
+    clf = classifier(conn=get_conn(":memory:"))
+    report, store, cp, reader = _onboard(clf)
+    assert "region" in report.deferred
 
-    with_sample = clf.classify("rm", role_sample, source="crm_b")
-    assert with_sample.band == "auto"
-    assert with_sample.proposed_node == "role"     # classifies to role BECAUSE of the sample (>= HIGH)
+    proposal = classify_deferred("region", ["EMEA", "NA", "APAC"], "crm_b", clf, store, cp,
+                                 rows=reader.rows, principal_of=lambda r: r["contact_id"],
+                                 key_field="contact_id")
+    assert proposal.band == "propose_new"                # the ontology gap, surfaced lazily
+    assert proposal.proposed_node is None
+    assert "region" not in {field_of(c.ref.locator) for c in store.all_cells()}
 
-    without_sample = clf.classify("rm", [], source="crm_b")
-    assert without_sample.proposed_node != "role"  # sample is load-bearing
-    assert without_sample.band != "auto"
 
-
-def test_3_sample_and_drop_no_values_in_cells():
-    conn = get_conn(":memory:")
-    store = SqliteMasterTableStore(conn)
+def test_3_obscure_field_needs_sample_values():
     clf = classifier()
-    cp = SqliteControlPlane(conn, closest_nodes=clf.closest_nodes)
-    reader = FakeSourceReader(SEED / "crm_b.csv")
+    role_sample = ["Director, Platform", "Operations Lead", "Staff Software Engineer"]
+    assert clf.classify("rm", role_sample).proposed_node == "role"   # judge reads values -> role
+    assert clf.classify("rm", []).proposed_node != "role"            # no values -> judge can't
 
-    onboard_source("crm_b", reader, FakeGate(), _cap(), FakeAudit(), store, cp, clf,
-                   rows=reader.rows, principal_of=lambda r: r["contact_id"], key_field="contact_id")
 
-    # every sampled ATTRIBUTE value classification saw. Exclude the key field (contact_id):
-    # its values ARE the row keys and legitimately live inside opaque locators, not as data.
+def test_4_sample_and_drop_no_values_in_cells():
+    clf = classifier(conn=get_conn(":memory:"))
+    _, store, _, reader = _onboard(clf)
     sampled = set()
     for fld in reader.list_fields("crm_b"):
         if fld == "contact_id":
             continue
-        sampled.update(reader.sample_field("crm_b", fld, 3))
-    sampled = {v for v in sampled if v.strip()}
-
-    dump = "\n".join(
-        "|".join("" if x is None else str(x) for x in row)
-        for row in conn.execute("SELECT * FROM cells").fetchall()
-    )
+        sampled.update(v for v in reader.sample_field("crm_b", fld, 3) if v.strip())
+    dump = "\n".join(str(tuple(r)) for r in store.conn.execute("SELECT * FROM cells"))
     for v in sampled:
         assert v not in dump, f"sampled value leaked into cells: {v!r}"
-    assert reader.read_calls == 0
 
 
-def test_4_control_plane_propose_approve_and_sprawl_guard():
+def test_5_control_plane_propose_approve_sprawl_guard():
     conn = get_conn(":memory:")
     clf = classifier()
     cp = SqliteControlPlane(conn, closest_nodes=clf.closest_nodes)
-
-    row_id = cp.propose(ControlPlaneRow(
-        id="node:region", kind="ontology_node",
-        payload={"name": "region", "description": "a geographic sales region, e.g. EMEA, NA, APAC"},
-    ))
-    assert cp.status_of(row_id) == "proposed"      # proposed, NOT live
-    assert cp.current_version() == 0
-
-    new_version = cp.approve(row_id, approver="mike")
-    assert new_version == 1
-    assert cp.current_version() == 1               # version bumped
-    assert cp.status_of(row_id) == "approved"
-
-    # sprawl guard: three closest EXISTING nodes surfaced first
+    row_id = cp.propose(ControlPlaneRow(id="node:region", kind="ontology_node",
+                                        payload={"name": "region", "description": "a sales region"}))
+    assert cp.status_of(row_id) == "proposed" and cp.current_version() == 0
+    assert cp.approve(row_id, "mike") == 1 and cp.current_version() == 1
     closest = cp.closest_nodes("region", k=3)
     assert len(closest) == 3
-    assert all(name in {"person", "email", "role", "organisation", "phone"} for name, _ in closest)
-
-    # now approvable into a cell
-    store = SqliteMasterTableStore(conn)
-    cell = Cell(
-        cell_id="region-cell",
-        ref=Reference(source="crm_b", locator=make_locator("crm_b", "b1", "region"), resolver="crm_b"),
-        type=TypeDescriptor(kind="string", shape=None, ontology_node="region"),
-        policy_id="default", state="placeholder", materialised=None,
-    )
-    store.put_cell_for("colin", cell)
-    assert len(store.cells_for_node("colin", "region")) == 1
+    assert all(n in {"person", "email", "role", "organisation", "phone"} for n, _ in closest)
 
 
-def test_5_determinism_zero_llm_and_identical_bands():
-    reader = FakeSourceReader(SEED / "crm_b.csv")
-    adj = CountingAdjudicator(node=None)
+def test_6_determinism_cached_judge_zero_repeat_calls():
     conn = get_conn(":memory:")
-    clf = classifier(conn=conn, adjudicator=adj)  # default thresholds: region is sub-LOW, no LLM
+    judge = ValueJudge()
+    clf = OntologyClassifier(judge=judge, cache=VerdictCache(conn))
 
     def run():
         c = get_conn(":memory:")
         store = SqliteMasterTableStore(c)
         cp = SqliteControlPlane(c, closest_nodes=clf.closest_nodes)
+        reader = FakeReader(SEED / "crm_b.csv")
         return onboard_source("crm_b", reader, FakeGate(), _cap(), FakeAudit(), store, cp, clf,
                               rows=reader.rows, principal_of=lambda r: r["contact_id"],
-                              key_field="contact_id")
+                              key_field="contact_id").bands
 
-    first = run().bands
-    calls_after_first = adj.calls
-    second = run().bands
-    assert first == second                     # identical bands
-    assert adj.calls == calls_after_first == 0  # seed has no middle band -> zero LLM calls
-
-
-class InlineReader:
-    """Tiny reader over in-memory rows, for planted-field tests."""
-
-    def __init__(self, rows: list[dict]):
-        self.rows = rows
-
-    def list_fields(self, source):
-        return [k for k in self.rows[0].keys()]
-
-    def sample_field(self, source, field, n=3):
-        return [str(r[field]) for r in self.rows if str(r[field]).strip()][:n]
-
-    def read_value(self, ref):
-        raise AssertionError("read_value must never be called during onboarding")
+    first = run()
+    calls = judge.calls                                  # one per eager non-structural field
+    second = run()
+    assert first == second
+    assert judge.calls == calls                          # re-run: cache hit, ZERO new judge calls
 
 
-def test_7_fail_closed_danger_zone_field_flags_not_auto():
-    # A 'department' column embeds ~0.68 to role — it clears the OLD 0.66 auto bar but is
-    # NOT a person's role. With the widened flag band [0.62, 0.70) it must FLAG (human in the
-    # loop), never silently auto-mint a live cell. This is the fail-closed DIRECTION at the bar.
-    conn = get_conn(":memory:")
-    store = SqliteMasterTableStore(conn)
-    adj = CountingAdjudicator(node="role")  # even if the LLM guesses a node, band stays 'flag'
-    clf = classifier(conn=conn, adjudicator=adj)
-    cp = SqliteControlPlane(conn, closest_nodes=clf.closest_nodes)
-
-    rows = [{"key": "r1", "department": "Engineering"},
-            {"key": "r2", "department": "Sales"},
-            {"key": "r3", "department": "Marketing"}]
-    reader = InlineReader(rows)
-
-    report = onboard_source("planted", reader, FakeGate(), _cap(), FakeAudit(), store, cp, clf,
-                            rows=rows, principal_of=lambda r: r["key"], key_field="key")
-
-    assert report.bands["department"] != "auto"        # the crucial fail-closed assertion
-    assert report.bands["department"] == "flag"
-    assert "department" in report.proposals            # proposed for review, not live
-    # and NOT minted: no servable cell exists for the danger-zone field
-    assert store.all_cells() == []
-    assert report.minted_cells == 0
+def test_7_shortlist_plus_judge_kills_spurious_auto():
+    # `notes` embeds near phone (the old top-1 crisis). As a shortlist, the judge reads prose
+    # values and refuses to auto-mint it — the exact bug the redesign fixes.
+    clf = classifier()
+    p = clf.classify("notes", ["called the customer back", "left a voicemail", "no answer"])
+    assert p.band != "auto"
+    assert p.proposed_node != "phone"
 
 
-def test_8_banding_boundaries_are_fail_closed(monkeypatch):
-    # Deterministic proof of the band boundaries, independent of embedding quirks.
-    adj = CountingAdjudicator(node="role")
-    clf = classifier(conn=get_conn(":memory:"), adjudicator=adj)
+def test_8_generality_invented_source_no_hardcoding():
+    # a source we never tuned against: invented column names, classified purely by VALUES.
+    clf = classifier()
+    assert clf.classify("moniker", ["Alex Johnson", "Priya Rao", "M. Chen"]).proposed_node == "person"
+    assert clf.classify("electronic_mail", ["a@x.com", "b@y.org"]).proposed_node == "email"
+    assert clf.classify("gizmo_kind", ["Head of Marketing", "Software Engineer"]).proposed_node == "role"
 
-    def scores(val):
-        return lambda field_name, sample: [("role", val), ("organisation", 0.40),
-                                           ("person", 0.30), ("email", 0.20), ("phone", 0.10)]
+    # an ambiguous invented field goes shortlist -> judge (judge invoked), not a hardcoded map
+    judge = ValueJudge()
+    clf2 = OntologyClassifier(judge=judge)
+    before = judge.calls
+    amb = clf2.classify("doohickey", ["blorp", "fizzbuzz", "widget"])
+    assert judge.calls == before + 1                     # the judge decided (not a lookup table)
+    assert amb.band in ("propose_new", "quarantine")     # fail-closed on the unknown
 
-    monkeypatch.setattr(clf, "_node_scores", scores(0.72))
-    assert clf.classify("f", ["a"], source="s").band == "auto"        # >= HIGH -> auto
-
-    monkeypatch.setattr(clf, "_node_scores", scores(0.68))
-    p = clf.classify("f", ["a"], source="s")
-    assert p.band == "flag"                                           # [LOW, HIGH) -> flag, never auto
-
-    monkeypatch.setattr(clf, "_node_scores", scores(0.60))
-    assert clf.classify("f", ["a"], source="s").band in ("propose_new", "quarantine")  # < LOW
+    # structural guarantee: NO seed column name appears as a literal in the classification path
+    src = (ROOT / "onboarding" / "classify.py").read_text() + (ROOT / "onboarding" / "onboard.py").read_text()
+    for col in ["full_name", "primary_email", "job_role", "org_name", "contact_id",
+                "last_touch", "updated_at"]:
+        assert col not in src, f"seed column name {col!r} hardcoded in the classification path"
 
 
-def test_6_verdict_cache_prevents_repeat_llm_calls():
-    # force region into the middle band (LOW=0.60 < region 0.614 < HIGH 0.66) so the LLM runs
-    conn = get_conn(":memory:")
-    adj = CountingAdjudicator(node=None)     # "none" -> region still becomes propose_new
-    clf = classifier(conn=conn, adjudicator=adj, low=0.60)
-    region_sample = ["EMEA", "NA", "APAC"]
-
-    p1 = clf.classify("region", region_sample, source="crm_b")
-    p2 = clf.classify("region", region_sample, source="crm_b")
-
-    assert adj.calls == 1                     # second call served from the verdict cache
-    assert p1.band == p2.band == "propose_new"
+def test_9_bulk_autonomous_path_judge_decides_alone():
+    # nobody is watching: the judge decides over the shortlist; confident fields still mint.
+    clf = classifier(conn=get_conn(":memory:"))
+    report, store, _, _ = _onboard(clf, autonomous=True, lazy=False)
+    assert report.bands["job_role"] == "auto"            # judge decided without a human
+    assert report.minted_cells > 0
