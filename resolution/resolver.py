@@ -5,12 +5,13 @@ There is NO durable `set_grouping` write path anywhere in this unit. A resolutio
 lives ONLY in a query-scoped `GroupingOverlay`, discarded when the query ends, so a wrong
 match is scoped to one query under one capability and cannot poison any other caller.
 
-Contract note: the frozen `Resolver.resolve(candidate_refs, caller, ctx)` has no `overlay`
-parameter, and `contract.py` is frozen. The overlay is therefore threaded through `ctx`
-(a dict that already flows resolve -> project -> fetch/join and into `gate.check`), i.e.
-`ctx["overlay"]`. `resolve` also accepts an explicit `overlay=` for the Unit 3 spec's
-ergonomics. FLAGGED for the contract owner: if an explicit contract param is preferred, that
-is a contract amendment.
+Contract note: the overlay is threaded through `resolve` as an EXPLICIT, MANDATORY parameter.
+A named parameter you must pass is forgettable-proof — the call site visibly shows the overlay
+is threaded through resolve -> join. There is deliberately NO ctx-keyed overlay side-channel:
+an invisible channel silently defaults to "no overlay" when forgotten, which is the un-catchable
+form of the bug the overlay design exists to prevent (Dana intermittently vanishing from the
+join). `contract.py` was amended post-freeze so the frozen `Resolver` protocol now carries this
+parameter — the contract matches reality, not routes around it.
 """
 from __future__ import annotations
 import re
@@ -62,7 +63,11 @@ def anthropic_same_adjudicator(text_a: str, text_b: str) -> dict:
 class GroupingOverlay:
     """In-memory, query-scoped grouping. Created once per query, passed through the whole
     resolve -> project -> fetch/join chain, discarded when the query ends. NEVER written to
-    the db. NEVER read back across queries."""
+    the db. NEVER read back across queries.
+
+    This is the CONCRETE implementation of the `contract.GroupingOverlay` seam Protocol (Unit 3
+    owns the impl; Unit 4 consumes it). Conformance is structural — the contract owns the type,
+    this module owns the implementation, and the layering points DOWN (unit -> contract) only."""
 
     def __init__(self) -> None:
         self._of: dict[str, str] = {}   # row_key -> overlay principal_id
@@ -140,8 +145,11 @@ class Resolver:
         self._memo: dict[tuple[str, str], dict] = {}  # IN-MEMORY only; never persisted
 
     def resolve(self, candidate_refs: list[Reference], caller: Capability,
-                ctx: Context, overlay: Optional[GroupingOverlay] = None):
-        overlay = overlay or (ctx.get("overlay") if isinstance(ctx, dict) else None) or GroupingOverlay()
+                ctx: Context, overlay: GroupingOverlay):
+        # overlay is MANDATORY and explicit — no ctx side-channel, no silent default. Passing
+        # None is a loud error, never a quiet no-overlay run that would make Dana vanish.
+        if overlay is None:
+            raise ValueError("resolve() requires an explicit GroupingOverlay (no ctx side-channel)")
 
         # gate the identifying reads (they are dereferences). Deny -> flat Refusal.
         if not self.gate.check(caller, dereference_predicate, ctx):
@@ -191,9 +199,8 @@ class Resolver:
         """Populate a FRESH overlay at demo start so live resolution is instant. In-memory
         only; never persisted; never shared across callers."""
         overlay = GroupingOverlay()
-        c = dict(ctx); c["overlay"] = overlay
         for refs in candidate_groups:
-            self.resolve(refs, caller, c, overlay)
+            self.resolve(refs, caller, ctx, overlay)
         return overlay
 
     # ---- internals ----

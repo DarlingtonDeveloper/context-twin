@@ -1,7 +1,20 @@
 """FROZEN shared contract. Do not edit without flagging the contract owner.
-All five units import types and interfaces from here."""
+All five units import types and interfaces from here.
+
+AMENDMENT 1 (deliberate, owner-sanctioned): `Resolver.resolve` carries an explicit, mandatory
+`overlay: GroupingOverlay` parameter. The overlay design landed AFTER this contract was frozen,
+so the seam and the real `resolution/resolver.py` had drifted; this reconciles the contract to
+reality (an explicit, mandatory overlay — no ctx side-channel).
+
+AMENDMENT 2 (deliberate, owner-sanctioned): `GroupingOverlay` is now a `Protocol` DEFINED HERE
+(see the seam interfaces). It is a cross-unit seam — created per query and threaded across the
+resolve->join boundary (Unit 3 owns the concrete impl, Unit 4 consumes it) — so by the same rule
+that puts `SourceReader`/`Gate`/`MasterTableStore`/`AuditSink` here, its type belongs in the
+contract. This replaces the earlier TYPE_CHECKING-only upward import (contract referencing a
+type living UP inside a unit); the layering now points DOWN only.
+"""
 from __future__ import annotations
-from typing import Callable, Protocol, Any, Literal, Optional
+from typing import Callable, Protocol, Any, Literal, Optional, runtime_checkable
 from datetime import datetime, timedelta
 from pydantic import BaseModel, model_validator, ConfigDict
 
@@ -152,8 +165,20 @@ class PolicyRegistry(Protocol):                                    # Unit 3
 class Projector(Protocol):                                         # Unit 3
     def project(self, cells: list[Cell], viewer: Capability, ctx: Context) -> ProjectedTable: ...
 
+@runtime_checkable
+class GroupingOverlay(Protocol):                                    # seam: Unit 3 owns impl, Unit 4 consumes
+    """In-memory, query-scoped grouping. Created per query, threaded through
+    resolve -> project -> fetch/join, discarded when the query ends. NEVER written to the db,
+    NEVER read back across queries. Carries groupings only, never values. `@runtime_checkable`
+    so callers can assert structural conformance at the seam."""
+    def merge(self, row_keys: list[str]) -> str: ...
+    def principal_of(self, row_key: str) -> Optional[str]: ...
+    def cells_for(self, store: "MasterTableStore", principal_id: str,
+                  node: Optional[str] = None) -> list[Cell]: ...
+
 class Resolver(Protocol):                                          # Unit 3
-    def resolve(self, candidate_refs: list[Reference], caller: Capability, ctx: Context) -> ResolvedPrincipal | Refusal: ...
+    def resolve(self, candidate_refs: list[Reference], caller: Capability, ctx: Context,
+                overlay: "GroupingOverlay") -> ResolvedPrincipal | Refusal: ...
 
 class Onboarder(Protocol):                                         # Unit 2
     def onboarding_read(self, ref: Reference, sample_n: int = 3) -> list[str]: ...
