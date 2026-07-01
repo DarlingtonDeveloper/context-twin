@@ -202,13 +202,44 @@ def test_6_determinism_cached_judge_zero_repeat_calls():
     assert judge.calls == calls                          # re-run: cache hit, ZERO new judge calls
 
 
-def test_7_shortlist_plus_judge_kills_spurious_auto():
-    # `notes` embeds near phone (the old top-1 crisis). As a shortlist, the judge reads prose
-    # values and refuses to auto-mint it — the exact bug the redesign fixes.
+def test_7_rejected_top_candidate_is_surfaced_not_discarded():
+    # `notes` embeds near phone (the old top-1 crisis). The judge reads prose values and
+    # refuses to auto-mint it. GAP-CHECK: it must be SURFACED for human review, never
+    # silently dropped (a dropped real attribute is fail-OPEN wearing fail-closed's clothes).
     clf = classifier()
-    p = clf.classify("notes", ["called the customer back", "left a voicemail", "no answer"])
+    notes = ["called the customer back", "left a voicemail", "no answer"]
+    p = clf.classify("notes", notes)
     assert p.band != "auto"
     assert p.proposed_node != "phone"
+    assert p.band == "propose_new"          # a reviewable band, not a silent discard
+
+    # ...and it actually lands as a human-visible control-plane proposal (fail-closed).
+    conn = get_conn(":memory:")
+    store = SqliteMasterTableStore(conn)
+    cp = SqliteControlPlane(conn, closest_nodes=clf.closest_nodes)
+    classify_deferred("notes", notes, "src", clf, store, cp,
+                      rows=[{"k": "r1", "notes": "x"}], principal_of=lambda r: r["k"], key_field="k")
+    assert cp.status_of("src:notes") == "proposed"   # surfaced somewhere a human sees it
+    assert store.all_cells() == []                    # and NOT minted as a live cell
+
+
+def test_10_deep_shortlist_node_still_judged():
+    # GAP-CHECK: the judge can only recover a node that MADE the shortlist. A field whose
+    # correct node sits DEEP (rank 3, not rank 2) must still reach the judge and classify.
+    # 'inbox_phone_line' over human names: email/phone out-rank person; person is rank 3.
+    clf = classifier()
+    field, sample, correct = "inbox_phone_line", ["Alex Johnson", "Priya Rao", "M. Chen"], "person"
+
+    ranked = clf._node_scores(field, sample)
+    rank = [n for n, _ in ranked].index(correct) + 1
+    assert rank >= 3, f"expected the correct node buried at rank>=3, got {rank}"   # genuinely deep
+    assert clf.classify(field, sample).proposed_node == correct                    # judge recovers it
+
+    # width matters: even a deliberately NARROW top-k keeps the rank-3 node via the margin
+    # floor, so recall does not collapse on mismatched vocabulary.
+    narrow = OntologyClassifier(judge=ValueJudge(), k=2)
+    assert correct in [n for n, _ in narrow.shortlist(field, sample)]
+    assert narrow.classify(field, sample).proposed_node == correct
 
 
 def test_8_generality_invented_source_no_hardcoding():
