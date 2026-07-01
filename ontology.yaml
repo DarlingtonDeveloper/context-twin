@@ -50,3 +50,27 @@ nodes:
       - telephone number
       - phone number
       - +1 555 010 1234
+
+# ---- concept hierarchy + concept-to-source routing (read-side semantic descent) ----
+# `nodes` above is the CLASSIFICATION vocabulary (field -> node, write-side). `concepts`
+# below is the QUERY vocabulary (query -> concept -> sources, read-side). They are kept
+# SEPARATE on purpose: adding `customer`/`employee` as classifier nodes would perturb
+# Unit 2's shortlists; here they are query concepts only, so classification is untouched.
+#
+# A query resolves to a CONCEPT, then DESCENDS concept -> sources. `customer` and
+# `employee` are kinds of `person`: asking for `person` (under-specified) surfaces every
+# source under it; asking for `customer` prunes to customer sources BEFORE any data is
+# touched (specificity prunes the search space, not the result set). The router has NO
+# source names in code — registering/removing a source is an edit to `sources` ONLY.
+concepts:
+  person: {}                    # root concept — the shared parent
+  customer: {parent: person}    # a person who is a contact/customer in a CRM
+  employee: {parent: person}    # a person employed by the organisation (no source yet)
+
+# Which concept each registered source instantiates. Both current sources are CRMs, so the
+# demo concept step is a DEGENERATE instance (one concept, both sources under it) — the real
+# descent still runs; it just happens to return both. Add an employee/transactions source by
+# adding a line here; the descent needs no code change (see the generality test).
+sources:
+  crm_a: customer
+  crm_b: customer
