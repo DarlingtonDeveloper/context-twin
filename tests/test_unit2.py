@@ -226,6 +226,68 @@ def test_5_determinism_zero_llm_and_identical_bands():
     assert adj.calls == calls_after_first == 0  # seed has no middle band -> zero LLM calls
 
 
+class InlineReader:
+    """Tiny reader over in-memory rows, for planted-field tests."""
+
+    def __init__(self, rows: list[dict]):
+        self.rows = rows
+
+    def list_fields(self, source):
+        return [k for k in self.rows[0].keys()]
+
+    def sample_field(self, source, field, n=3):
+        return [str(r[field]) for r in self.rows if str(r[field]).strip()][:n]
+
+    def read_value(self, ref):
+        raise AssertionError("read_value must never be called during onboarding")
+
+
+def test_7_fail_closed_danger_zone_field_flags_not_auto():
+    # A 'department' column embeds ~0.68 to role — it clears the OLD 0.66 auto bar but is
+    # NOT a person's role. With the widened flag band [0.62, 0.70) it must FLAG (human in the
+    # loop), never silently auto-mint a live cell. This is the fail-closed DIRECTION at the bar.
+    conn = get_conn(":memory:")
+    store = SqliteMasterTableStore(conn)
+    adj = CountingAdjudicator(node="role")  # even if the LLM guesses a node, band stays 'flag'
+    clf = classifier(conn=conn, adjudicator=adj)
+    cp = SqliteControlPlane(conn, closest_nodes=clf.closest_nodes)
+
+    rows = [{"key": "r1", "department": "Engineering"},
+            {"key": "r2", "department": "Sales"},
+            {"key": "r3", "department": "Marketing"}]
+    reader = InlineReader(rows)
+
+    report = onboard_source("planted", reader, FakeGate(), _cap(), FakeAudit(), store, cp, clf,
+                            rows=rows, principal_of=lambda r: r["key"], key_field="key")
+
+    assert report.bands["department"] != "auto"        # the crucial fail-closed assertion
+    assert report.bands["department"] == "flag"
+    assert "department" in report.proposals            # proposed for review, not live
+    # and NOT minted: no servable cell exists for the danger-zone field
+    assert store.all_cells() == []
+    assert report.minted_cells == 0
+
+
+def test_8_banding_boundaries_are_fail_closed(monkeypatch):
+    # Deterministic proof of the band boundaries, independent of embedding quirks.
+    adj = CountingAdjudicator(node="role")
+    clf = classifier(conn=get_conn(":memory:"), adjudicator=adj)
+
+    def scores(val):
+        return lambda field_name, sample: [("role", val), ("organisation", 0.40),
+                                           ("person", 0.30), ("email", 0.20), ("phone", 0.10)]
+
+    monkeypatch.setattr(clf, "_node_scores", scores(0.72))
+    assert clf.classify("f", ["a"], source="s").band == "auto"        # >= HIGH -> auto
+
+    monkeypatch.setattr(clf, "_node_scores", scores(0.68))
+    p = clf.classify("f", ["a"], source="s")
+    assert p.band == "flag"                                           # [LOW, HIGH) -> flag, never auto
+
+    monkeypatch.setattr(clf, "_node_scores", scores(0.60))
+    assert clf.classify("f", ["a"], source="s").band in ("propose_new", "quarantine")  # < LOW
+
+
 def test_6_verdict_cache_prevents_repeat_llm_calls():
     # force region into the middle band (LOW=0.60 < region 0.614 < HIGH 0.66) so the LLM runs
     conn = get_conn(":memory:")

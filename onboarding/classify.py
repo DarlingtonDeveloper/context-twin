@@ -15,12 +15,28 @@ through the control plane. A misclassification can never silently become a serva
 
 A structural pre-filter quarantines obvious keys (`id`, `*_id`) and timestamp columns
 before embedding — they are not attributes, and their names ('contact_id', 'last_touch')
-otherwise embed spuriously near real concepts. Quarantine is the safe direction: a
-wrongly-parked field simply awaits human approval (fail-closed), never a wrong auto-serve.
+otherwise embed spuriously near real concepts (contact_id->email 0.76, updated_at->phone
+0.73, both ABOVE the auto bar). This filter is load-bearing, not cosmetic: it kills the
+worst spurious matches before they can auto-mint. Quarantine is the safe direction.
 
-Thresholds HIGH=0.66 / LOW=0.62 were tuned on the seed (see the commit): the eight true
-crm_a/crm_b attribute fields all score >= 0.70 to their correct node, while `region`
-(the ontology gap) tops out at 0.614 — so it lands `propose_new`, never `auto`.
+THRESHOLDS ARE CALIBRATED PER ONTOLOGY, NOT UNIVERSAL. The *method* generalises
+(multi-exemplar max-pool + structural pre-filter + human-in-the-band); the constants are
+tuned per deployment and should be recalibrated when a new-vocabulary source is onboarded.
+For THIS ontology, tuned on the seed:
+  - HIGH=0.70: the eight true crm_a/crm_b attribute fields all clear 0.70 (min is
+    `name`->person = 0.7003, the binding constraint — a thin margin, honestly). `region`
+    (the ontology gap) tops out at 0.614, so it lands `propose_new`, never `auto`.
+  - LOW=0.62: the flag band is a WIDE [0.62, 0.70). This is a deliberate fail-closed
+    choice: a spurious field that clears the old 0.66 bar (e.g. `department`->role 0.68,
+    `linkedin`->organisation 0.68) now routes to the human-confirmed LLM band instead of
+    silently auto-minting. Nothing in the seed hits [0.62, 0.70), so seed determinism and
+    the zero-LLM-on-seed property are untouched.
+
+KNOWN RESIDUAL LIMITATION (bge-small, not a bug): a few spurious fields still clear 0.70
+on real data (e.g. a free-text `notes`->phone 0.74). Embeddings alone cannot separate
+these; the mitigations are the structural pre-filter (common id/date cases), the wide flag
+band (0.62-0.70), and per-ontology recalibration on onboarding. Do not present 0.70 as a
+law of nature — it is a per-deployment calibration.
 """
 from __future__ import annotations
 import hashlib
@@ -37,8 +53,8 @@ import yaml
 from contract import AuditEntry, Capability, ClassificationProposal
 from onboarding.embed import Embedder, cosine, default_embedder
 
-HIGH = 0.66
-LOW = 0.62
+HIGH = 0.70   # auto bar. Binding constraint: name->person = 0.7003 (see module docstring).
+LOW = 0.62    # flag band is a deliberately WIDE [LOW, HIGH) so danger-zone fields flag, not auto.
 
 _ONTOLOGY_PATH = Path(__file__).resolve().parent.parent / "ontology.yaml"
 
